@@ -1,0 +1,36 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    // {
+    //   "type": "scala",
+    //   "name": "run Client",
+    //   "request": "launch",
+    //   "mainClass": "blindnet.client.ClientApp",
+    //   "args": []
+    // }
+    {
+      "type": "scala",
+      "name": "run Main",
+      "request": "launch",
+      "mainClass": "blindnet.app.Main",
+      "args": []
+    }
+    // {
+    //   "type": "scala",
+    //   "name": "run Router 1",
+    //   "request": "launch",
+    //   "mainClass": "blindnet.router.RouterApp1",
+    //   "args": []
+    // },
+    // {
+    //   "type": "scala",
+    //   "name": "run Router 2",
+    //   "request": "launch",
+    //   "mainClass": "blindnet.router.RouterApp2",
+    //   "args": []
+    // }
+  ]
+}
