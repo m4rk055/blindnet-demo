@@ -1,12 +1,12 @@
 package blindnet.client
 
+import cats.effect.IO._
 import cats.effect._
 import cats.effect.concurrent._
-import cats.effect.IO._
 import cats.implicits._
 import fs2._
-import tsec.cipher.symmetric.jca._
 import tsec.cipher.symmetric._
+import tsec.cipher.symmetric.jca._
 
 object Util {
 

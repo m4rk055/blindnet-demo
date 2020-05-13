@@ -1,32 +1,21 @@
 package blindnet.app
 
+import scala.concurrent.duration._
+
+import blindnet.client.Client._
+import blindnet.client._
+import cats.effect.IO._
 import cats.effect._
+import cats.effect.concurrent._
+import fs2.io.tcp._
 import org.http4s._
 import org.http4s.dsl.io._
 import org.http4s.implicits._
 import org.http4s.server.Router
 import org.http4s.server.blaze._
-
-import cats.effect.concurrent._
-import cats.effect.IO._
-import fs2.io.tcp._
 import tsec.cipher.symmetric._
 import tsec.cipher.symmetric.jca._
-
-import blindnet.client._
-import blindnet.client.Client._
-
-import cats.effect._
-import cats.effect.concurrent._
-import cats.effect.IO._
-import fs2.io.tcp._
-
-import tsec.cipher.symmetric._
-import tsec.cipher.symmetric.jca._
-// import tsec.cipher.symmetric.jca.primitive._
-// import tsec.cipher.common.padding._
-
-import scala.concurrent.duration._
+// import tsec.cipher.symmetric.jca.primitive._// import tsec.cipher.common.padding._import tsec.cipher.symmetric.jca._
 
 // object Main extends IOApp {
 
@@ -139,7 +128,7 @@ object Main extends IOApp {
           // connections to first hop router
           connections <- Ref.of[IO, Connections](Map.empty[RouterId, RouterConnection])
           _           <- createCircuits(socketGroup, connections)
-          _ <- BlazeServerBuilder[IO]
+          _ <- BlazeServerBuilder[IO](scala.concurrent.ExecutionContext.Implicits.global)
                 .bindHttp(8080, "localhost")
                 .withHttpApp(httpApp(socketGroup, connections))
                 .resource

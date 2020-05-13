@@ -1,24 +1,20 @@
 package blindnet.client
 
+import blindnet.model._
+import cats.effect.IO._
 import cats.effect._
 import cats.effect.concurrent._
-import cats.effect.IO._
 import cats.implicits._
 import com.comcast.ip4s._
 import fs2._
 import fs2.io.tcp._
-// import scala.util.Random
-import blindnet.model._
-
-import tsec.common._
 import tsec.cipher.symmetric._
 import tsec.cipher.symmetric.jca._
-// import tsec.cipher.symmetric.jca.primitive._
-// import tsec.cipher.common.padding._
-import tsec.hashing.jca._
+import tsec.common._
 import tsec.hashing._
-// import scala.concurrent.duration.FiniteDuration
-// import java.util.concurrent.TimeUnit
+import tsec.hashing.jca._
+
+// import scala.util.Random
 
 trait Client {
   def createCircuit0(): Stream[IO, Unit]
@@ -26,8 +22,8 @@ trait Client {
 
 object Client {
 
-  import Util._
   import Services._
+  import Util._
 
   def make(implicit cs: ContextShift[IO]) =
     Blocker[IO].use { blocker =>

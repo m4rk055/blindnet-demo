@@ -1,15 +1,17 @@
 package blindnet.model
 
+import java.nio.ByteBuffer
+
+import scala.util.Try
+
 import cats.implicits._
-import scodec._
-import scodec.codecs._
 import scodec.Attempt._
+import scodec._
+import scodec.bits._
+import scodec.codecs._
 import tsec.common._
 import tsec.hashing._
 import tsec.hashing.jca._
-import java.nio.ByteBuffer
-import scodec.bits._
-import scala.util.Try
 
 trait RelayCommand {
   def getId: Byte = this match {

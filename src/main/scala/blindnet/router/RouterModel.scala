@@ -1,10 +1,8 @@
 package blindnet.router
 
-// import cats.effect._
-// import fs2.io.tcp._
-import tsec.cipher.symmetric.jca._
-import blindnet.model.MessageSocket
 import blindnet.model.EncryptedCell
+import blindnet.model.MessageSocket
+import tsec.cipher.symmetric.jca._
 
 case class RouterData(id: String, ip: String, port: Int)
 

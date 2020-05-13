@@ -1,13 +1,12 @@
 package blindnet.router
 
+import cats.effect.IO._
 import cats.effect._
 import cats.effect.concurrent._
-import cats.effect.IO._
 import com.comcast.ip4s._
-import fs2.io.tcp._
 import fs2.Stream
 import fs2.io.tcp.SocketGroup
-
+import fs2.io.tcp._
 import tsec.cipher.symmetric._
 import tsec.cipher.symmetric.jca._
 
