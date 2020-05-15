@@ -314,8 +314,10 @@ object Client {
 
       msgId = Random.nextInt(255).toByte
 
-      // 1 byte for toLen, toLen Bytes for to, 1 byte for msgId, 1 byte for i, 1 byte for end, 1 by for forLen, forLen bytes for from
-      cellDataLen  = 498 - 1 - to.length() - 1 - 1 - 1 - 1 - from.length()
+      // 1 byte for toLen, toLen Bytes for to, 1 byte for msgId,
+      // 1 byte for i, 1 byte for end, 1 by for forLen, forLen bytes for from
+      // 2 bytes for msgLen
+      cellDataLen  = 498 - 1 - to.length() - 1 - 1 - 1 - 1 - from.length() - 2
       bytes        = msg.utf8Bytes
       groupedBytes = bytes.grouped(cellDataLen).toList
 
@@ -330,6 +332,7 @@ object Client {
                       Array[Byte](msgId) ++
                       Array(from.length().toByte) ++
                       from.getBytes ++
+                      java.nio.ByteBuffer.allocate(2).putShort(gb.length.toShort).array() ++
                       gb ++
                       Array.fill[Byte](cellDataLen - gb.length)(0)
 
@@ -364,6 +367,36 @@ object Client {
           }
 
       _ <- putLnIO(s"${cells.length} cells sent")
+
+    } yield ()
+
+  case class IncomingCell(
+    i: Byte,
+    last: Boolean,
+    msgId: Byte,
+    from: String,
+    content: String
+  )
+
+  def handleIncomingCells(waiting: Ref[IO, List[IncomingCell]], newCells: List[Array[Byte]]) =
+    for {
+      key <- AES128CTR.buildKey[IO](Array[Byte](1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3))
+
+      decrypted <- newCells.traverse { cell =>
+                    AES128CTR.decrypt[IO](noIvCT(cell), key).map { data =>
+                      val i       = data.take(1).head
+                      val last    = data.drop(1).take(1).head == 1.toByte
+                      val msgId   = data.drop(2).take(1).head
+                      val fromLen = data.drop(3).take(1).head
+                      val from    = data.drop(4).take(fromLen).toAsciiString
+                      val len     = data.drop(4 + fromLen).take(2).toShortUnsafe
+                      val content = data.drop(4 + fromLen + 2).take(len).toAsciiString
+
+                      IncomingCell(i, last, msgId, from, content)
+                    }
+                  }
+
+      _ <- putLnIO(decrypted)
 
     } yield ()
 }

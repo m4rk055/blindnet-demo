@@ -98,6 +98,23 @@ object DemoApp {
     createCircuit(routerIds1, socketGroup, connections, q).compile.drain.start *>
       IO.sleep(5 second) *>
       createCircuit(routerIds2, socketGroup, connections, q).compile.drain.start
+
+  def handleIncoming(
+    httpClient: org.http4s.client.Client[IO],
+    waiting: Ref[IO, List[IncomingCell]],
+    name: String
+  )(implicit t: Timer[IO]): IO[Unit] = {
+    val program =
+      for {
+        newCells <- httpClient.expect(s"http://localhost:8081/get/$name")(jsonOf[IO, List[Array[Byte]]])
+        _        <- if (newCells.length > 0) handleIncomingCells(waiting, newCells) else IO.unit
+
+        _ <- IO.sleep(500 millis)
+        _ <- handleIncoming(httpClient, waiting, name)
+      } yield ()
+
+    program.handleErrorWith(e => IO(println(e)))
+  }
 }
 
 object MainAlice extends IOApp {
@@ -122,6 +139,10 @@ object MainAlice extends IOApp {
             q           <- Queue.bounded[IO, String](100)
             _           <- q.dequeue.evalMap(s => IO(println(s))).compile.drain.start
             _           <- createCircuits(socketGroup, connections, q, (1, 2, 3), (4, 1, 5))
+
+            waiting <- Ref.of[IO, List[IncomingCell]](List.empty)
+            _       <- handleIncoming(httpClient, waiting, name).start
+
             _ <- BlazeServerBuilder[IO](scala.concurrent.ExecutionContext.global)
                   .bindHttp(8080, "localhost")
                   .withHttpApp(service(socketGroup, connections, q, name).orNotFound)

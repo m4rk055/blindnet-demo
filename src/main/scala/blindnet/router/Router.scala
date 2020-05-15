@@ -294,12 +294,12 @@ object Router {
               } yield ()
           }
 
-      case RELAY(_, _, len, DATA(to, _, msg)) =>
+      case RELAY(_, _, _, DATA(to, _, msg)) =>
         Stream
           .eval(for {
             _ <- putLnIO("forwarding cell to msg pool")
 
-            cell = blindnet.msgpool.CellData(to, msg.take(len))
+            cell = blindnet.msgpool.CellData(to, msg)
             req  = POST(cell.asJson, uri"http://localhost:8081/enqueue")
             _    <- httpClient.expect(req)(jsonOf[IO, blindnet.msgpool.CellData])
 
