@@ -26,16 +26,16 @@ trait RelayCommand {
 
     case EXTEND(hs, rId) =>
       Try(
-        ByteBuffer.allocate(1).put(hs).array() ++
+        ByteBuffer.allocate(4).putInt(hs).array() ++
           ByteBuffer.allocate(2).put(rId.getBytes()).array() ++
-          ByteBuffer.allocate(495).array()
+          ByteBuffer.allocate(492).array()
       ).toEither
 
     case EXTENDED(hs, kh) =>
       Try(
-        ByteBuffer.allocate(1).put(hs).array() ++
+        ByteBuffer.allocate(4).putInt(hs).array() ++
           ByteBuffer.allocate(20).put(kh).array() ++
-          ByteBuffer.allocate(477).array()
+          ByteBuffer.allocate(473).array()
       ).toEither
 
     case BEGIN(x) =>
@@ -47,17 +47,22 @@ trait RelayCommand {
     case CONNECTED =>
       Try(ByteBuffer.allocate(498).array()).toEither
 
-    case DATA(data) =>
-      Try(data).toEither
+    case DATA(to, toLen, msg) => {
+      Try(
+        ByteBuffer.allocate(1).put(toLen).array() ++
+          ByteBuffer.allocate(toLen).put(to.getBytes()).array() ++
+          msg
+      ).toEither
+    }
   }
 }
-case class EXTEND(handshake: Byte, routerId: String) extends RelayCommand
-case class EXTENDED(handshake: Byte, keyHash: CryptoHash[SHA1]) extends RelayCommand {
+case class EXTEND(handshake: Int, routerId: String) extends RelayCommand
+case class EXTENDED(handshake: Int, keyHash: CryptoHash[SHA1]) extends RelayCommand {
   override def toString() = s"EXTENDED($handshake, ${keyHash.toHexString}"
 }
-case class BEGIN(x: String)            extends RelayCommand
-case object CONNECTED                  extends RelayCommand
-case class DATA(datatype: Array[Byte]) extends RelayCommand
+case class BEGIN(x: String)                                extends RelayCommand
+case object CONNECTED                                      extends RelayCommand
+case class DATA(to: String, toLen: Byte, msg: Array[Byte]) extends RelayCommand
 
 trait Command {
   def getId: Byte = this match {
@@ -70,15 +75,15 @@ trait Command {
   def getBytes: Either[Throwable, Array[Byte]] = this match {
     case CREATE(hs) =>
       Try(
-        ByteBuffer.allocate(1).put(hs.toByte).array() ++
-          ByteBuffer.allocate(508).array()
+        ByteBuffer.allocate(4).putInt(hs).array() ++
+          ByteBuffer.allocate(495).array()
       ).toEither
 
     case CREATED(hs, kh) =>
       Try(
-        ByteBuffer.allocate(1).put(hs.toByte).array() ++
+        ByteBuffer.allocate(4).putInt(hs).array() ++
           ByteBuffer.allocate(20).put(kh).array() ++
-          ByteBuffer.allocate(488).array()
+          ByteBuffer.allocate(453).array()
       ).toEither
 
     case DESTROY() =>
@@ -90,8 +95,8 @@ trait Command {
     case _ => Right(ByteBuffer.allocate(512).array())
   }
 }
-case class CREATE(handshake: Byte) extends Command
-case class CREATED(handshake: Byte, keyHash: CryptoHash[SHA1]) extends Command {
+case class CREATE(handshake: Int) extends Command
+case class CREATED(handshake: Int, keyHash: CryptoHash[SHA1]) extends Command {
   override def toString() = s"CREATED($handshake, ${keyHash.toHexString}"
 }
 case class DESTROY() extends Command
@@ -179,72 +184,15 @@ object EncryptedCell {
 
 object Cell {
 
-  val cEnc: Encoder[Cell] = new Encoder[Cell] {
-
-    def encode(value: Cell): Attempt[BitVector] =
-      Attempt.fromEither(
-        value.getBytes.bimap(
-          e => Err.General(e.getMessage(), Nil),
-          bytes => BitVector(bytes)
-        )
-      )
-
-    def sizeBound: SizeBound = SizeBound(512, Some(512)) // what is this?
-  }
-
-  val cDec: Decoder[Cell] = new Decoder[Cell] {
-    def decode(bits: BitVector): Attempt[DecodeResult[Cell]] = {
-      val arr = bits.toByteArray
-      if (arr.length != 512) Failure(Err.General(s"expected 512 bytes, got ${arr.length}", Nil))
-      else {
-        val cId = arr.take(2).toShortUnsafe
-        val cmd = ByteBuffer.wrap(arr.drop(2).take(1)).get
-        if (cmd == 1) {
-          val hs = ByteBuffer.wrap(arr.drop(3).take(1)).get
-          Successful(DecodeResult(Cell(CREATE(hs), cId), BitVector.empty))
-        } else if (cmd == 2) {
-          val hs = ByteBuffer.wrap(arr.drop(3).take(1)).get
-          val kh = arr.drop(4).take(20)
-          Successful(DecodeResult(Cell(CREATED(hs, CryptoHash(kh)), cId), BitVector.empty))
-        } else if (cmd == 3) {
-          Successful(DecodeResult(Cell(DESTROY(), cId), BitVector.empty))
-        } else if (cmd == 4) {
-          val sid  = arr.drop(3).take(2).toShortUnsafe
-          val dig  = arr.drop(5).take(6)
-          val len  = arr.drop(11).take(2).toShortUnsafe
-          val rCmd = ByteBuffer.wrap(arr.drop(13).take(1)).get
-          if (rCmd == 1) {
-            val hs  = ByteBuffer.wrap(arr.drop(14).take(1)).get
-            val rId = arr.drop(15).take(2).toAsciiString
-            Successful(
-              DecodeResult(Cell(RELAY(sid, dig, len, EXTEND(hs, rId)), cId), BitVector.empty)
-            )
-          } else if (rCmd == 2) {
-            val hs = ByteBuffer.wrap(arr.drop(14).take(1)).get
-            val kh = arr.drop(15).take(20)
-            Successful(
-              DecodeResult(Cell(RELAY(sid, dig, len, EXTENDED(hs, CryptoHash(kh))), cId), BitVector.empty)
-            )
-          } else if (rCmd == 5) {
-            val data = arr.drop(15)
-            Successful(DecodeResult(Cell(RELAY(sid, dig, len, DATA(data)), cId), BitVector.empty))
-          } else
-            Failure(Err.General(s"unknown relay command $rCmd", Nil))
-        } else
-          Failure(Err.General(s"unknown command $cmd", Nil))
-      }
-    }
-  }
-
   def decodeCell(cId: Short, cmd: Byte, payload: Array[Byte]): Either[String, Cell] =
     Try(
       if (payload.length != 509) Left(s"expected payload 509 bytes, got ${payload.length}")
       else if (cmd == 1) {
-        val hs = payload.take(1).head
+        val hs = payload.take(4).toIntUnsafe
         Right(Cell(CREATE(hs), cId))
       } else if (cmd == 2) {
-        val hs = payload.take(1).head
-        val kh = payload.drop(1).take(20)
+        val hs = payload.take(4).toIntUnsafe
+        val kh = payload.drop(4).take(20)
         Right(Cell(CREATED(hs, CryptoHash(kh)), cId))
       } else if (cmd == 3) {
         Right(Cell(DESTROY(), cId))
@@ -254,16 +202,18 @@ object Cell {
         val len  = payload.drop(8).take(2).toShortUnsafe
         val rCmd = payload.drop(10).take(1).head
         if (rCmd == 1) {
-          val hs  = payload.drop(11).take(1).head
-          val rId = payload.drop(12).take(2).toAsciiString
+          val hs  = payload.drop(11).take(4).toIntUnsafe
+          val rId = payload.drop(15).take(2).toAsciiString
           Right(Cell(RELAY(sid, dig, len, EXTEND(hs, rId)), cId))
         } else if (rCmd == 2) {
-          val hs = payload.drop(11).take(1).head
-          val kh = payload.drop(12).take(20)
+          val hs = payload.drop(11).take(4).toIntUnsafe
+          val kh = payload.drop(15).take(20)
           Right(Cell(RELAY(sid, dig, len, EXTENDED(hs, CryptoHash(kh))), cId))
         } else if (rCmd == 5) {
-          val data = payload.drop(11)
-          Right(Cell(RELAY(sid, dig, len, DATA(data)), cId))
+          val toLen = payload.drop(11).take(1).head
+          val to    = payload.drop(12).take(toLen).toAsciiString
+          val msg   = payload.drop(12 + toLen)
+          Right(Cell(RELAY(sid, dig, len, DATA(to, toLen, msg)), cId))
         } else
           Left(s"unknown relay command $rCmd")
       } else
@@ -274,23 +224,4 @@ object Cell {
     arr => Encoder.encodeSeq(byte)(arr.toIndexedSeq),
     buffer => Decoder.decodeCollect[Array, Byte](byte, None)(buffer)
   )
-  val cryptoHash: Codec[CryptoHash[SHA1]] = byteArr.xmap(barr => CryptoHash(barr), ch => ch)
-
-  val relayCommandCodec: Codec[RelayCommand] = discriminated[RelayCommand]
-    .by(uint8)
-    .typecase(1, (byte :: utf8_32).as[EXTEND])
-    .typecase(2, (byte :: cryptoHash).as[EXTENDED])
-    .typecase(3, utf8_32.as[BEGIN])
-    .typecase(4, provide(CONNECTED))
-    .typecase(5, byteArr.as[DATA])
-
-  val commandCodec: Codec[Command] = discriminated[Command]
-    .by(uint8)
-    .typecase(1, byte.as[CREATE])
-    .typecase(2, (byte :: cryptoHash).as[CREATED])
-    .typecase(3, provide(DESTROY()))
-    .typecase(4, (short16 :: byteArr :: short16 :: relayCommandCodec).as[RELAY])
-
-  val cellCodec: Codec[Cell] =
-    (commandCodec :: short16).as[Cell]
 }

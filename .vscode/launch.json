@@ -13,9 +13,9 @@
     // }
     {
       "type": "scala",
-      "name": "run Main",
+      "name": "run MainAlice",
       "request": "launch",
-      "mainClass": "blindnet.app.Main",
+      "mainClass": "blindnet.app.MainAlice",
       "args": []
     }
     // {

@@ -20,6 +20,14 @@ import tsec.cipher.symmetric.jca._
 import tsec.cipher.symmetric.jca.primitive._
 import tsec.common._
 import tsec.hashing.jca._
+import org.http4s.client.blaze._
+import org.http4s.client._
+import org.http4s.client.dsl.io._
+import io.circe.generic.auto._
+import io.circe.syntax._
+import org.http4s.dsl.io._
+import org.http4s.circe._
+import org.http4s.implicits._
 
 object Router {
 
@@ -54,61 +62,126 @@ object Router {
     cachedInstance: JCAPrimitiveCipher[IO, AES128CTR, CTR, NoPadding]
   ) =
     Stream.eval(Ref.of[IO, Connections](Map.empty[RouterId, RouterConnection])).flatMap { routerConnections =>
-      socketGroup
-        .server[IO](new InetSocketAddress(port.value))
-        .map { clientSocketResource =>
-          Stream
-            .resource(clientSocketResource)
-            .flatMap(clientSocket =>
-              putLnStream(s"NEW CONNECTION") >>
-                (for {
-                  circuits      <- Stream.eval(Ref[IO].of(Map.empty[Short, RCircuitState]))
-                  messageSocket <- Stream.eval(MessageSocketInstances.encryptedCells(clientSocket))
-                  _ <- handleConnection(
-                        socketGroup,
-                        messageSocket,
-                        // clientSocket,
-                        circuits,
-                        routers,
-                        data,
-                        routerConnections
-                      ).onFinalize(clearCircuits(circuits) *> clientSocket.close.attempt.void)
-                } yield ())
-            )
-            .onFinalize(putLnIO("connection disconnected") *> clearConnections(routerConnections))
-        }
-        .parJoinUnbounded
+      Stream.resource(BlazeClientBuilder[IO](scala.concurrent.ExecutionContext.global).resource).flatMap { httpClient =>
+        socketGroup
+          .server[IO](new InetSocketAddress(port.value))
+          .map { clientSocketResource =>
+            Stream
+              .resource(clientSocketResource)
+              .flatMap(clientSocket =>
+                putLnStream(s"NEW CONNECTION") >>
+                  (for {
+                    circuits      <- Stream.eval(Ref[IO].of(Map.empty[Short, RCircuitState]))
+                    messageSocket <- Stream.eval(MessageSocketInstances.encryptedCells(clientSocket))
+                    _ <- handleConnection(
+                          socketGroup,
+                          messageSocket,
+                          // clientSocket,
+                          circuits,
+                          routers,
+                          data,
+                          routerConnections,
+                          httpClient
+                        ).onFinalize(clearCircuits(circuits) *> clientSocket.close.attempt.void)
+                  } yield ())
+              )
+              .onFinalize(putLnIO("connection disconnected") *> clearConnections(routerConnections))
+          }
+          .parJoinUnbounded
+      }
     }
 
-  def handleCreateCell(
-    messageSocket: MessageSocket[EncryptedCell, EncryptedCell],
+  def handleNextHopConnection(
+    nextMsgSocket: MessageSocket[EncryptedCell, EncryptedCell],
+    next: RouterData,
+    rConn: RouterConnection,
     circuits: Ref[IO, Map[Short, RCircuitState]],
-    handshake: Byte,
-    data: AppData,
-    cId: Short
+    previousMessageSocket: MessageSocket[EncryptedCell, EncryptedCell]
+  )(
+    implicit cs: ContextShift[IO],
+    ctrStrategy: IvGen[IO, AES128CTR],
+    cachedInstance: JCAPrimitiveCipher[IO, AES128CTR, CTR, NoPadding]
   ) =
-    for {
-      _ <- IO.unit
-      // y      <- IO(Random.between(1, 10))
-      y      = 1
-      key    = (math.pow(handshake, y) % data.p).toInt
-      aesKey <- AES128CTR.buildKey[IO]((1 to 12).map(_ => 0: Byte).toArray ++ key.toBytes)
-      _      <- putLnIO(s"session key=${aesKey.key.getEncoded.toHexString}")
-      _      <- circuits.update(_ + (cId -> KeyExchanged(aesKey)))
+    nextMsgSocket.read
+      .evalTap(ec => putLnIO(s"BACKWARD got encrypted cell from router ${next.id} cId=${ec.circuitId} command=${ec.command}"))
+      .evalMap {
 
-      hs      = (math.pow(data.g, y) % data.p).toByte
-      keyHash = key.toBytes.hash[SHA1]
-      _       <- putLnIO(s"DH y=$y hs=$hs key_hash=${keyHash.toHexString}")
+        case EncryptedCell(cId, 2, payload) =>
+          for {
+            previousCircId <- rConn.mappings.get.map(_.get(cId))
+            _ <- previousCircId match {
+                  case None => putLnIO(s"Previous circuit id for $cId not found")
+                  case Some(prevCid) =>
+                    for {
+                      cell <- Cell.decodeCell(cId, 2, payload).toIO
 
-      cell = Cell(CREATED(hs, keyHash), cId)
+                      _ <- cell.cmd match {
+                            case CREATED(hs, kh) =>
+                              for {
+                                _    <- IO.unit
+                                cell = Cell(RELAY(cmd = EXTENDED(hs, kh)), prevCid)
 
-      cellPayload <- cell.getPayload.toIO
+                                cs <- circuits.get.flatMap(
+                                       _.get(cId)
+                                         .fold(
+                                           raiseErrorIO[RCircuitState](s"circuit $cId not found")
+                                         )(cs => IO(cs))
+                                     )
 
-      encryptedCell = EncryptedCell(cell.circuitId, cell.cmd.getId, cellPayload)
+                                cellPayload      <- cell.getPayload.toIO
+                                encryptedPayload <- AES128CTR.encrypt[IO](PlainText(cellPayload), cs.key)
 
-      _ <- putLnIO(s"BACKWARD sending CREATED cell")
-      _ <- messageSocket.write1(encryptedCell)
-    } yield ()
+                                encryptedCell = EncryptedCell(
+                                  cell.circuitId,
+                                  cell.cmd.getId,
+                                  encryptedPayload.content
+                                )
+
+                                _ <- putLnIO(s"BACKWARD sending RELAY EXTENDED cell")
+                                _ <- previousMessageSocket.write1(encryptedCell)
+                                // TODO: unsafe
+                                _ <- circuits.update(circs =>
+                                      circs.updatedWith(prevCid)(x => Complete(x.get.key, x.get.asInstanceOf[AwaitingNextHop].next).some)
+                                    )
+
+                              } yield ()
+                          }
+                    } yield ()
+                }
+          } yield ()
+
+        case EncryptedCell(cId, 4, payload) =>
+          for {
+            previousCircId <- rConn.mappings.get.map(_.get(cId))
+            _ <- previousCircId match {
+                  case None => putLnIO(s"Previous circuit id for $cId not found")
+                  case Some(prevCid) =>
+                    for {
+                      cs <- circuits.get.flatMap(
+                             _.get(cId)
+                               .fold(
+                                 raiseErrorIO[RCircuitState](s"circuit $cId not found")
+                               )(cs => IO(cs))
+                           )
+
+                      encryptedPayload <- AES128CTR.encrypt[IO](PlainText(payload), cs.key)
+
+                      encryptedCell = EncryptedCell(
+                        prevCid,
+                        4,
+                        encryptedPayload.content
+                      )
+
+                      _ <- putLnIO(s"BACKWARD sending RELAY cell cId=$prevCid, cmd=4")
+                      _ <- previousMessageSocket.write1(encryptedCell)
+
+                    } yield ()
+
+                }
+          } yield ()
+
+        case cell => IO.raiseError(new Throwable(s"not implemented handling for cell $cell"))
+      }
 
   def handleRelayCell(
     socketGroup: SocketGroup,
@@ -117,7 +190,8 @@ object Router {
     relayCommand: RELAY,
     routers: Ref[IO, Map[String, RouterData]],
     circuits: Ref[IO, Map[Short, RCircuitState]],
-    routerConnections: Ref[IO, Connections]
+    routerConnections: Ref[IO, Connections],
+    httpClient: Client[IO]
   )(
     implicit cs: ContextShift[IO],
     ctrStrategy: IvGen[IO, AES128CTR],
@@ -199,90 +273,7 @@ object Router {
                           _       <- Stream.eval(circuits.update(_ + (previousCircuitId -> AwaitingNextHop(circState.key, nextHop))))
                           _       <- Stream.eval(rConn.mappings.update(_ + (nextCircId -> previousCircuitId)))
 
-                          _ <- nextMsgSocket.read
-                                .evalTap(ec =>
-                                  putLnIO(s"BACKWARD got encrypted cell from router ${next.id} cId=${ec.circuitId} command=${ec.command}")
-                                )
-                                .evalMap {
-
-                                  case EncryptedCell(cId, 2, payload) =>
-                                    for {
-                                      previousCircId <- rConn.mappings.get.map(_.get(cId))
-                                      _ <- previousCircId match {
-                                            case None => putLnIO(s"Previous circuit id for $cId not found")
-                                            case Some(prevCid) =>
-                                              for {
-                                                cell <- Cell.decodeCell(cId, 2, payload).toIO
-
-                                                _ <- cell.cmd match {
-                                                      case CREATED(hs, kh) =>
-                                                        for {
-                                                          _    <- IO.unit
-                                                          cell = Cell(RELAY(cmd = EXTENDED(hs, kh)), prevCid)
-
-                                                          cs <- circuits.get.flatMap(
-                                                                 _.get(cId)
-                                                                   .fold(
-                                                                     raiseErrorIO[RCircuitState](s"circuit $cId not found")
-                                                                   )(cs => IO(cs))
-                                                               )
-
-                                                          cellPayload      <- cell.getPayload.toIO
-                                                          encryptedPayload <- AES128CTR.encrypt[IO](PlainText(cellPayload), cs.key)
-
-                                                          encryptedCell = EncryptedCell(
-                                                            cell.circuitId,
-                                                            cell.cmd.getId,
-                                                            encryptedPayload.content
-                                                          )
-
-                                                          _ <- putLnIO(s"BACKWARD sending RELAY EXTENDED cell")
-                                                          _ <- previousMessageSocket.write1(encryptedCell)
-                                                          // TODO: unsafe
-                                                          _ <- circuits.update(circs =>
-                                                                circs.updatedWith(prevCid)(x =>
-                                                                  Complete(x.get.key, x.get.asInstanceOf[AwaitingNextHop].next).some
-                                                                )
-                                                              )
-
-                                                        } yield ()
-                                                    }
-                                              } yield ()
-                                          }
-                                    } yield ()
-
-                                  case EncryptedCell(cId, 4, payload) =>
-                                    for {
-                                      previousCircId <- rConn.mappings.get.map(_.get(cId))
-                                      _ <- previousCircId match {
-                                            case None => putLnIO(s"Previous circuit id for $cId not found")
-                                            case Some(prevCid) =>
-                                              for {
-                                                cs <- circuits.get.flatMap(
-                                                       _.get(cId)
-                                                         .fold(
-                                                           raiseErrorIO[RCircuitState](s"circuit $cId not found")
-                                                         )(cs => IO(cs))
-                                                     )
-
-                                                encryptedPayload <- AES128CTR.encrypt[IO](PlainText(payload), cs.key)
-
-                                                encryptedCell = EncryptedCell(
-                                                  prevCid,
-                                                  4,
-                                                  encryptedPayload.content
-                                                )
-
-                                                _ <- putLnIO(s"BACKWARD sending RELAY cell cId=$prevCid, cmd=4")
-                                                _ <- previousMessageSocket.write1(encryptedCell)
-
-                                              } yield ()
-
-                                          }
-                                    } yield ()
-
-                                  case cell => IO.raiseError(new Throwable(s"not implemented handling for cell $cell"))
-                                }
+                          _ <- handleNextHopConnection(nextMsgSocket, next, rConn, circuits, previousMessageSocket)
                         } yield ()
 
                         Stream.eval(
@@ -303,14 +294,51 @@ object Router {
               } yield ()
           }
 
-      case RELAY(_, _, len, DATA(msg)) =>
-        for {
-          _ <- putLnStream(msg.take(len).toUtf8String)
-        } yield ()
+      case RELAY(_, _, len, DATA(to, _, msg)) =>
+        Stream
+          .eval(for {
+            _ <- putLnIO("forwarding cell to msg pool")
+
+            cell = blindnet.msgpool.CellData(to, msg.take(len))
+            req  = POST(cell.asJson, uri"http://localhost:8081/enqueue")
+            _    <- httpClient.expect(req)(jsonOf[IO, blindnet.msgpool.CellData])
+
+          } yield ())
+          .handleErrorWith(_ => Stream.emit(()))
 
       case r =>
         putLnStream(s"unexpected relay cell $r")
     }
+
+  def handleCreateCell(
+    messageSocket: MessageSocket[EncryptedCell, EncryptedCell],
+    circuits: Ref[IO, Map[Short, RCircuitState]],
+    handshake: Int,
+    data: AppData,
+    cId: Short
+  ) =
+    for {
+      _ <- IO.unit
+      // y      <- IO(Random.between(1, 10))
+      y      = 1
+      key    = (math.pow(handshake, y) % data.p).toInt
+      aesKey <- AES128CTR.buildKey[IO]((1 to 12).map(_ => 0: Byte).toArray ++ key.toBytes)
+      _      <- putLnIO(s"session key=${aesKey.key.getEncoded.toHexString}")
+      _      <- circuits.update(_ + (cId -> KeyExchanged(aesKey)))
+
+      hs      = (math.pow(data.g, y) % data.p).toInt
+      keyHash = key.toBytes.hash[SHA1]
+      _       <- putLnIO(s"DH y=$y hs=$hs key_hash=${keyHash.toHexString}")
+
+      cell = Cell(CREATED(hs, keyHash), cId)
+
+      cellPayload <- cell.getPayload.toIO
+
+      encryptedCell = EncryptedCell(cell.circuitId, cell.cmd.getId, cellPayload)
+
+      _ <- putLnIO(s"BACKWARD sending CREATED cell")
+      _ <- messageSocket.write1(encryptedCell)
+    } yield ()
 
   def handleConnection(
     socketGroup: SocketGroup,
@@ -319,7 +347,8 @@ object Router {
     circuits: Ref[IO, Map[Short, RCircuitState]],
     routers: Ref[IO, Map[String, RouterData]],
     data: AppData,
-    routerConnections: Ref[IO, Connections]
+    routerConnections: Ref[IO, Connections],
+    httpClient: Client[IO]
   )(
     implicit cs: ContextShift[IO],
     ctrStrategy: IvGen[IO, AES128CTR],
@@ -386,7 +415,8 @@ object Router {
                                     r,
                                     routers,
                                     circuits,
-                                    routerConnections
+                                    routerConnections,
+                                    httpClient
                                   )
                               else
                                 Stream.eval(

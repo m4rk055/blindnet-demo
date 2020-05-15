@@ -8,41 +8,41 @@ import cats.implicits._
 import com.comcast.ip4s._
 import fs2._
 import fs2.io.tcp._
+import fs2.concurrent.Queue
 import tsec.cipher.symmetric._
 import tsec.cipher.symmetric.jca._
 import tsec.common._
 import tsec.hashing._
 import tsec.hashing.jca._
+import scala.util.Random
 
-// import scala.util.Random
-
-trait Client {
-  def createCircuit0(): Stream[IO, Unit]
-}
+// trait Client {
+//   def createCircuit0(): Stream[IO, Unit]
+// }
 
 object Client {
 
   import Services._
   import Util._
 
-  def make(implicit cs: ContextShift[IO]) =
-    Blocker[IO].use { blocker =>
-      SocketGroup[IO](blocker).use { socketGroup =>
-        // implicit val cachedInstance = AES128CTR.genEncryptor[IO]
-        implicit val ctrStrategy: IvGen[IO, AES128CTR] = new IvGen[IO, AES128CTR] {
-          val zeros                      = Array.fill(16)(0: Byte)
-          def genIv: IO[Iv[AES128CTR]]   = IO.pure(Iv[AES128CTR](zeros))
-          def genIvUnsafe: Iv[AES128CTR] = Iv[AES128CTR](zeros)
-        }
+  // def make(implicit cs: ContextShift[IO]) =
+  //   Blocker[IO].use { blocker =>
+  //     SocketGroup[IO](blocker).use { socketGroup =>
+  //       // implicit val cachedInstance = AES128CTR.genEncryptor[IO]
+  //       implicit val ctrStrategy: IvGen[IO, AES128CTR] = new IvGen[IO, AES128CTR] {
+  //         val zeros                      = Array.fill(16)(0: Byte)
+  //         def genIv: IO[Iv[AES128CTR]]   = IO.pure(Iv[AES128CTR](zeros))
+  //         def genIvUnsafe: Iv[AES128CTR] = Iv[AES128CTR](zeros)
+  //       }
 
-        for {
-          connections <- Ref.of[IO, Connections](Map.empty[RouterId, RouterConnection])
-        } yield new Client {
+  //       for {
+  //         connections <- Ref.of[IO, Connections](Map.empty[RouterId, RouterConnection])
+  //       } yield new Client {
 
-          def createCircuit0(): Stream[IO, Unit] = createCircuit((1, 2, 3), socketGroup, connections)
-        }
-      }
-    }
+  //         def createCircuit0(): Stream[IO, Unit] = createCircuit((1, 2, 3), socketGroup, connections)
+  //       }
+  //     }
+  //   }
 
   def createSocket(
     socketGroup: SocketGroup,
@@ -70,12 +70,11 @@ object Client {
   def createCircuit(
     routerIds: (Int, Int, Int),
     socketGroup: SocketGroup,
-    connections: Ref[IO, Connections]
+    connections: Ref[IO, Connections],
+    q: Queue[IO, String]
   )(
     implicit cs: ContextShift[IO],
-    // t: Timer[IO],
     ctrStrategy: IvGen[IO, AES128CTR]
-    // cachedInstance: JCAPrimitiveCipher[IO, AES128CTR, CTR, NoPadding]
   ) =
     Stream.eval(getRouters()).flatMap { routers =>
       val (r1, r2, r3) = (routers(routerIds._1 - 1), routers(routerIds._2 - 1), routers(routerIds._3 - 1))
@@ -89,9 +88,8 @@ object Client {
           _      <- circStates.update(_ + (circId -> Established(circId, r1, r2, r3)))
 
           // TODO: DH
-          // x  <- IO(Random.between(1, 3))
-          x  = 1
-          hs = (math.pow(r1.g, x) % r1.p).toByte
+          x  <- IO(Random.between(1, 7))
+          hs = (math.pow(r1.g, x) % r1.p).toInt
           _  <- putLnIO(s"Generating DH parameters for R1 x=$x hs=$hs")
 
           payload <- CREATE(hs).getBytes.toIO
@@ -115,7 +113,7 @@ object Client {
                     (for {
                       (circStates, msgSocket) <- createSocket(socketGroup, r1, connections)
                       _                       <- Stream.eval(sendCreate(circStates, msgSocket))
-                      _                       <- process(msgSocket, circStates)
+                      _                       <- process(msgSocket, circStates, q)
                     } yield ())
               }
         } yield ()
@@ -124,7 +122,7 @@ object Client {
         case e =>
           Stream.eval(IO(println(s"error with socket ${r1.id} ${r1.ip}:${r1.port} - ${e}"))) ++
             Stream.eval(
-              connections.get.map(cons => cons.toList.traverse(con => con._2.socket.close.attempt.void)) *>
+              connections.get.flatMap(cons => cons.toList.traverse(con => con._2.socket.close.attempt.void)) *>
                 connections.set(Map.empty)
             )
       }
@@ -176,7 +174,7 @@ object Client {
     messageSocket: MessageSocket[EncryptedCell, EncryptedCell],
     circuitStates: Ref[IO, Map[CircuitId, CircuitState]],
     cs: AwaitingCreated,
-    hs: Byte,
+    hs: Int,
     kh: CryptoHash[SHA1],
     circId: Short
   )(implicit ctrStrategy: IvGen[IO, AES128CTR]) =
@@ -189,9 +187,8 @@ object Client {
       aesKey  <- AES128CTR.buildKey[IO]((1 to 12).map(_ => 0: Byte).toArray ++ key.toBytes)
       _       = println(s"session key for R1 = ${aesKey.key.getEncoded.toHexString}")
 
-      // x2  <- IO(Random.between(3, 6))
-      x2  = 2
-      hs2 = (math.pow(cs.router2.g, x2) % cs.router2.p).toByte
+      x2  <- IO(Random.between(1, 7))
+      hs2 = (math.pow(cs.router2.g, x2) % cs.router2.p).toInt
       _   <- putLnIO(s"DH for R2 x2=$x2 hs2=$hs2")
 
       _ <- circuitStates.update(_.updated(circId, OneHop(circId, x2, Router(cs.router1.id, aesKey), cs.router2, cs.router3)))
@@ -214,11 +211,9 @@ object Client {
 
   def process(
     messageSocket: MessageSocket[EncryptedCell, EncryptedCell],
-    circuitStates: Ref[IO, Map[CircuitId, CircuitState]]
-  )(
-    implicit ctrStrategy: IvGen[IO, AES128CTR]
-    // cachedInstance: JCAPrimitiveCipher[IO, AES128CTR, CTR, NoPadding]
-  ): Stream[IO, Unit] =
+    circuitStates: Ref[IO, Map[CircuitId, CircuitState]],
+    q: Queue[IO, String]
+  )(implicit ctrStrategy: IvGen[IO, AES128CTR]): Stream[IO, Unit] =
     messageSocket.read
       .evalTap(ec => putLnIO(s"got cell cId=${ec.circuitId} command=${ec.command}"))
       .evalMap {
@@ -255,9 +250,8 @@ object Client {
                       router2AesKey <- AES128CTR.buildKey[IO]((1 to 12).map(_ => 0: Byte).toArray ++ router2Key.toBytes)
                       _             = println(s"session key for R2 = ${router2AesKey.key.getEncoded.toHexString}")
 
-                      // x3  <- IO(Random.between(6, 10))
-                      x3  = 3
-                      hs3 = (math.pow(r3.g, x3) % r3.p).toByte
+                      x3  <- IO(Random.between(1, 7))
+                      hs3 = (math.pow(r3.g, x3) % r3.p).toInt
                       _   <- putLnIO(s"DH for R3 x3=$x3 hs3=$hs3")
 
                       _ <- circuitStates.update(_.updated(cId, TwoHop(cId, x3, r1, Router(r2.id, router2AesKey), r3)))
@@ -293,6 +287,8 @@ object Client {
                       _ <- putLnIO("successfully created circuit")
                       _ <- putLnIO("----------------------------")
 
+                      _ <- q.enqueue1(s"yeeeeej ${r1.id} -> $cId")
+
                     } yield ()
 
                   case s => IO.raiseError(new Throwable(s"invalid state $s for EXTENDED command"))
@@ -302,7 +298,12 @@ object Client {
         case cell => IO.raiseError(new Throwable(s"not implemented handling for cell $cell"))
       }
 
-  def sendMessage(msg: String, connections: Ref[IO, Connections])(implicit ctrStrategy: IvGen[IO, AES128CTR]) =
+  def sendMessage(
+    msg: String,
+    from: String,
+    to: String,
+    connections: Ref[IO, Connections]
+  )(implicit ctrStrategy: IvGen[IO, AES128CTR]) =
     for {
       _              <- IO.unit
       twoConnections <- connections.get.map(cons => cons.take(2).map(_._2))
@@ -311,16 +312,41 @@ object Client {
                    connection.circuits.get.map(_.head).flatMap(c => cast[ThreeHop](c._2)).map((connection.socket, _))
                  )
 
+      msgId = Random.nextInt(255).toByte
+
+      // 1 byte for toLen, toLen Bytes for to, 1 byte for msgId, 1 byte for i, 1 byte for end, 1 by for forLen, forLen bytes for from
+      cellDataLen  = 498 - 1 - to.length() - 1 - 1 - 1 - 1 - from.length()
       bytes        = msg.utf8Bytes
-      groupedBytes = bytes.grouped(498).toList
+      groupedBytes = bytes.grouped(cellDataLen).toList
 
-      cells = groupedBytes.zipWithIndex.map {
-        case (gb, i) =>
-          val full = gb ++ Array.fill[Byte](498 - gb.length)(0)
-          Cell(RELAY(0, full.hash[SHA1].take(6), gb.length.toShort, DATA(full)), circuits(i % 2)._2.circuitId)
-      }
+      key <- AES128CTR.buildKey[IO](Array[Byte](1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3))
 
-      _ <- putLnIO(s"${cells.length} cells sent")
+      cells <- groupedBytes.zipWithIndex.traverse {
+                case (gb, i) =>
+                  val isLast: Byte = if (i == groupedBytes.length - 1) 1 else 0
+                  val full =
+                    Array[Byte](i.toByte) ++
+                      Array[Byte](isLast) ++
+                      Array[Byte](msgId) ++
+                      Array(from.length().toByte) ++
+                      from.getBytes ++
+                      gb ++
+                      Array.fill[Byte](cellDataLen - gb.length)(0)
+
+                  AES128CTR
+                    .encrypt[IO](PlainText(full), key)
+                    .map(eFull =>
+                      Cell(
+                        RELAY(
+                          0,
+                          (Array(to.length.toByte) ++ to.getBytes() ++ eFull.content).hash[SHA1].take(6),
+                          gb.length.toShort,
+                          DATA(to, to.length.toByte, eFull.content)
+                        ),
+                        circuits(i % 2)._2.circuitId
+                      )
+                    )
+              }
 
       _ <- cells.zipWithIndex.traverse {
             case (cell, i) =>
@@ -336,6 +362,8 @@ object Client {
 
               } yield ()
           }
+
+      _ <- putLnIO(s"${cells.length} cells sent")
 
     } yield ()
 }
