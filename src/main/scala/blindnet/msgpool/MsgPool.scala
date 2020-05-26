@@ -4,11 +4,7 @@ import cats.effect.IO._
 import cats.effect._
 import cats.effect.concurrent._
 import org.http4s._
-import org.http4s.dsl.io._
-import org.http4s.implicits._
-import org.http4s.server.blaze._
 import io.circe.generic.auto._
-import org.http4s._
 import org.http4s.dsl.io._
 import org.http4s.server.blaze._
 import org.http4s.implicits._

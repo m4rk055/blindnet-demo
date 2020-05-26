@@ -378,7 +378,14 @@ object Client {
     content: String
   )
 
-  def handleIncomingCells(waiting: Ref[IO, List[IncomingCell]], newCells: List[Array[Byte]]) =
+  // from -> (msgId -> (i, last, content))
+  type Received = Map[String, Map[Byte, List[(Byte, Boolean, String)]]]
+
+  def handleIncomingCells(
+    received: Ref[IO, Received],
+    completeMessages: Ref[IO, List[(String, String)]],
+    newCells: List[Array[Byte]]
+  ) =
     for {
       key <- AES128CTR.buildKey[IO](Array[Byte](1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3))
 
@@ -396,7 +403,36 @@ object Client {
                     }
                   }
 
-      _ <- putLnIO(decrypted)
+      _ <- decrypted.traverse(cell =>
+            received.update(rec =>
+              rec.get(cell.from) match {
+                case Some(from) =>
+                  from.get(cell.msgId) match {
+                    case Some(cells) =>
+                      rec.updated(cell.from, from.updated(cell.msgId, cells :+ (cell.i, cell.last, cell.content)))
+                    case None =>
+                      rec.updated(cell.from, from + (cell.msgId -> List((cell.i, cell.last, cell.content))))
+                  }
+                case None =>
+                  rec + (cell.from -> Map(cell.msgId -> List((cell.i, cell.last, cell.content))))
+              }
+            )
+          )
+
+      rec <- received.get
+      _ <- rec.toList.traverse {
+            case (from, cells) =>
+              cells.toList.traverse {
+                case (msgId, msgs) => {
+                  val all  = msgs.sortBy(_._1)
+                  val last = all.last
+                  if (last._2 == true && last._1 == all.size - 1) {
+                    completeMessages.update(compl => compl :+ (from, all.map(_._3).mkString)) *>
+                      received.update(rec => rec.updated(from, rec(from) - msgId))
+                  } else IO.unit
+                }
+              }
+          }
 
     } yield ()
 }

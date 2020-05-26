@@ -18,14 +18,24 @@ import tsec.cipher.symmetric.jca._
 import org.http4s.client.blaze._
 import org.http4s.implicits._
 import org.http4s.circe._
+import io.circe.generic.auto._
 import io.circe.{ Decoder, Encoder }
+import io.circe.syntax._
 
 object DemoApp {
+
   case class SendData(to: String, msg: String)
 
   object SendData {
     implicit val enc: Encoder[SendData] = io.circe.generic.semiauto.deriveEncoder[SendData]
     implicit val dec: Decoder[SendData] = io.circe.generic.semiauto.deriveDecoder[SendData]
+  }
+
+  case class ReceiveMessage(from: String, msg: String)
+
+  object ReceiveMessage {
+    implicit val enc: Encoder[ReceiveMessage] = io.circe.generic.semiauto.deriveEncoder[ReceiveMessage]
+    implicit val dec: Decoder[ReceiveMessage] = io.circe.generic.semiauto.deriveDecoder[ReceiveMessage]
   }
 
   // TODO: horrible
@@ -41,11 +51,13 @@ object DemoApp {
     if (isStateOk(connections)) IO.unit
     else IO.sleep(100 millis) *> waitForOkState(connections)
 
-  implicit val dec = jsonOf[IO, SendData]
+  implicit val sddec = jsonOf[IO, SendData]
+  implicit val rmdec = jsonOf[IO, ReceiveMessage]
 
   def service(
     socketGroup: SocketGroup,
     connections: Ref[IO, Connections],
+    completeMessages: Ref[IO, List[(String, String)]],
     q: Queue[IO, String],
     name: String
   )(implicit ctrStrategy: IvGen[IO, AES128CTR], cs: ContextShift[IO], t: Timer[IO]): HttpRoutes[IO] =
@@ -79,12 +91,19 @@ object DemoApp {
                  Ok("circuits not finished")
         } yield ok
 
+      case GET -> Root / "receive" =>
+        for {
+          messages <- completeMessages.getAndSet(Nil)
+          ok       <- Ok(messages.map(msg => ReceiveMessage(msg._1, msg._2)).asJson)
+        } yield ok
+
       case GET -> Root / "state" =>
         for {
-          cons   <- connections.get
-          cc     = cons.view.mapValues(c => c.circuits.get.unsafeRunSync()).toMap
-          output = cc.toList.map(c => s"${c._1} -> ${c._2.keySet.mkString(", ")}").mkString("\n")
-          ok     <- Ok(s"$output")
+          // cons   <- connections.get
+          // cc     = cons.view.mapValues(c => c.circuits.get.unsafeRunSync()).toMap
+          // output = cc.toList.map(c => s"${c._1} -> ${c._2.keySet.mkString(", ")}").mkString("\n")
+          // ok     <- Ok(s"$output")
+          ok <- if (isStateOk(connections)) Ok("ok") else Ok("not ok")
         } yield ok
     }
 
@@ -101,16 +120,17 @@ object DemoApp {
 
   def handleIncoming(
     httpClient: org.http4s.client.Client[IO],
-    waiting: Ref[IO, List[IncomingCell]],
+    received: Ref[IO, Received],
+    completeMessages: Ref[IO, List[(String, String)]],
     name: String
   )(implicit t: Timer[IO]): IO[Unit] = {
     val program =
       for {
         newCells <- httpClient.expect(s"http://localhost:8081/get/$name")(jsonOf[IO, List[Array[Byte]]])
-        _        <- if (newCells.length > 0) handleIncomingCells(waiting, newCells) else IO.unit
+        _        <- if (newCells.length > 0) handleIncomingCells(received, completeMessages, newCells) else IO.unit
 
         _ <- IO.sleep(500 millis)
-        _ <- handleIncoming(httpClient, waiting, name)
+        _ <- handleIncoming(httpClient, received, completeMessages, name)
       } yield ()
 
     program.handleErrorWith(e => IO(println(e)))
@@ -140,12 +160,13 @@ object MainAlice extends IOApp {
             _           <- q.dequeue.evalMap(s => IO(println(s))).compile.drain.start
             _           <- createCircuits(socketGroup, connections, q, (1, 2, 3), (4, 1, 5))
 
-            waiting <- Ref.of[IO, List[IncomingCell]](List.empty)
-            _       <- handleIncoming(httpClient, waiting, name).start
+            received         <- Ref.of[IO, Received](Map.empty)
+            completeMessages <- Ref.of[IO, List[(String, String)]](List.empty)
+            _                <- handleIncoming(httpClient, received, completeMessages, name).start
 
             _ <- BlazeServerBuilder[IO](scala.concurrent.ExecutionContext.global)
-                  .bindHttp(8080, "localhost")
-                  .withHttpApp(service(socketGroup, connections, q, name).orNotFound)
+                  .bindHttp(8090, "localhost")
+                  .withHttpApp(service(socketGroup, connections, completeMessages, q, name).orNotFound)
                   .resource
                   .use(_ => IO.never)
           } yield ()
@@ -175,10 +196,15 @@ object MainBob extends IOApp {
             connections <- Ref.of[IO, Connections](Map.empty[RouterId, RouterConnection])
             q           <- Queue.bounded[IO, String](100)
             _           <- q.dequeue.evalMap(s => IO(println(s))).compile.drain.start
-            _           <- createCircuits(socketGroup, connections, q, (1, 2, 3), (4, 1, 5))
+            _           <- createCircuits(socketGroup, connections, q, (6, 2, 4), (4, 5, 6))
+
+            received         <- Ref.of[IO, Received](Map.empty)
+            completeMessages <- Ref.of[IO, List[(String, String)]](List.empty)
+            _                <- handleIncoming(httpClient, received, completeMessages, name).start
+
             _ <- BlazeServerBuilder[IO](scala.concurrent.ExecutionContext.global)
-                  .bindHttp(8080, "localhost")
-                  .withHttpApp(service(socketGroup, connections, q, name).orNotFound)
+                  .bindHttp(8091, "localhost")
+                  .withHttpApp(service(socketGroup, connections, completeMessages, q, name).orNotFound)
                   .resource
                   .use(_ => IO.never)
           } yield ()
