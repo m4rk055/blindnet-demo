@@ -1,12 +1,14 @@
 package blindnet.client
 
+import java.time.LocalDateTime
+
 import blindnet.model._
 import cats.effect.IO._
 import cats.effect._
 import cats.effect.concurrent._
 import cats.implicits._
 import com.comcast.ip4s._
-import fs2._
+import fs2.Stream
 import fs2.io.tcp._
 import fs2.concurrent.Queue
 import tsec.cipher.symmetric._
@@ -15,6 +17,15 @@ import tsec.common._
 import tsec.hashing._
 import tsec.hashing.jca._
 import scala.util.Random
+import blindnet.monitor.Monitor.MonitorCellData
+import org.http4s.client.dsl.io._
+import org.http4s.dsl.io._
+import org.http4s.circe._
+import org.http4s.client.{ Client => HttpClient }
+import blindnet.monitor.Monitor.MonitorCellData._
+import io.circe.syntax._
+import blindnet.Endpoints
+import org.http4s.Uri
 
 // trait Client {
 //   def createCircuit0(): Stream[IO, Unit]
@@ -44,6 +55,16 @@ object Client {
   //     }
   //   }
 
+  def sendToMonitor(name: String, bytes: Array[Byte], httpClient: HttpClient[IO], direction: String) =
+    for {
+      now     <- IO(LocalDateTime.now())
+      monCell = MonitorCellData(now, name, bytes, direction)
+      req     = POST(monCell.asJson, Uri.unsafeFromString(s"${Endpoints.monitor}/push"))
+      _ <- httpClient
+            .expect[String](req)
+            .handleErrorWith(e => putLnIO(s"Error sending cell to monitor - $e"))
+    } yield ()
+
   def createSocket(
     socketGroup: SocketGroup,
     router: RouterToConnect,
@@ -71,7 +92,9 @@ object Client {
     routerIds: (Int, Int, Int),
     socketGroup: SocketGroup,
     connections: Ref[IO, Connections],
-    q: Queue[IO, String]
+    q: Queue[IO, String],
+    name: String,
+    httpClient: HttpClient[IO]
   )(
     implicit cs: ContextShift[IO],
     ctrStrategy: IvGen[IO, AES128CTR]
@@ -94,8 +117,10 @@ object Client {
 
           payload <- CREATE(hs).getBytes.toIO
           // TODO: encrypt with R1 SK
-          _ <- msgSocket.write1(EncryptedCell(circId, 1, payload))
-          _ <- putLnIO(s"sending CREATE cell to R1 with hs=$hs, cId=${circId}")
+          ec = EncryptedCell(circId, 1, payload)
+          _  <- msgSocket.write1(ec)
+          _  <- sendToMonitor(name, ec.getBytesMonitoring, httpClient, "out")
+          _  <- putLnIO(s"sending CREATE cell to R1 with hs=$hs, cId=${circId}")
 
           _ <- circStates.update(_.updated(circId, AwaitingCreated(circId, x, r1, r2, r3)))
 
@@ -113,7 +138,7 @@ object Client {
                     (for {
                       (circStates, msgSocket) <- createSocket(socketGroup, r1, connections)
                       _                       <- Stream.eval(sendCreate(circStates, msgSocket))
-                      _                       <- process(msgSocket, circStates, q)
+                      _                       <- process(msgSocket, circStates, q, name, httpClient)
                     } yield ())
               }
         } yield ()
@@ -176,7 +201,9 @@ object Client {
     cs: AwaitingCreated,
     hs: Int,
     kh: CryptoHash[SHA1],
-    circId: Short
+    circId: Short,
+    name: String,
+    httpClient: HttpClient[IO]
   )(implicit ctrStrategy: IvGen[IO, AES128CTR]) =
     for {
       _ <- IO.unit
@@ -206,13 +233,16 @@ object Client {
       encryptedCell = EncryptedCell(cell.circuitId, cell.cmd.getId, encryptedPayload.content)
 
       _ <- messageSocket.write1(encryptedCell)
-      _ <- putLnIO(s"sending EXTEND cell for R2 encrtpted with K1, hs=$hs2")
+      _ <- sendToMonitor(name, encryptedCell.getBytesMonitoring, httpClient, "out")
+      _ <- putLnIO(s"sending EXTEND cell for R2 encrypted with K1, hs=$hs2")
     } yield ()
 
   def process(
     messageSocket: MessageSocket[EncryptedCell, EncryptedCell],
     circuitStates: Ref[IO, Map[CircuitId, CircuitState]],
-    q: Queue[IO, String]
+    q: Queue[IO, String],
+    name: String,
+    httpClient: HttpClient[IO]
   )(implicit ctrStrategy: IvGen[IO, AES128CTR]): Stream[IO, Unit] =
     messageSocket.read
       .evalTap(ec => putLnIO(s"got cell cId=${ec.circuitId} command=${ec.command}"))
@@ -229,7 +259,7 @@ object Client {
 
         case Cell(CREATED(hs, kh), cId) =>
           circuitStates.getState(cId).flatMap(cast[AwaitingCreated]).flatMap { circState =>
-            handleCreatedCell(messageSocket, circuitStates, circState, hs, kh, cId)
+            handleCreatedCell(messageSocket, circuitStates, circState, hs, kh, cId, name, httpClient)
           }
 
         // case Destroy
@@ -269,6 +299,7 @@ object Client {
 
                       _ <- putLnIO(s"sending EXTEND cell for R3 encrypted with K1 and K2, hs=$hs3")
                       _ <- messageSocket.write1(encryptedCell)
+                      _ <- sendToMonitor(name, encryptedCell.getBytesMonitoring, httpClient, "out")
                     } yield ()
 
                   case TwoHop(_, x3, r1, r2, r3) =>
@@ -302,7 +333,8 @@ object Client {
     msg: String,
     from: String,
     to: String,
-    connections: Ref[IO, Connections]
+    connections: Ref[IO, Connections],
+    httpClient: HttpClient[IO]
   )(implicit ctrStrategy: IvGen[IO, AES128CTR]) =
     for {
       _              <- IO.unit
@@ -362,6 +394,8 @@ object Client {
                 ec = EncryptedCell(cell.circuitId, cell.cmd.getId, encryptedPayload3.content)
 
                 _ <- circuits(i % 2)._1.write1(ec)
+
+                _ <- sendToMonitor(from, ec.getBytesMonitoring, httpClient, "out")
 
               } yield ()
           }

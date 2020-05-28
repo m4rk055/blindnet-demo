@@ -2,6 +2,7 @@ package blindnet.router
 
 import java.net.InetSocketAddress
 import java.util.concurrent.TimeUnit
+import java.time.LocalDateTime
 
 import scala.concurrent.duration.FiniteDuration
 
@@ -27,11 +28,24 @@ import io.circe.generic.auto._
 import io.circe.syntax._
 import org.http4s.dsl.io._
 import org.http4s.circe._
-import org.http4s.implicits._
+import blindnet.monitor.Monitor.MonitorCellData._
+import blindnet.monitor.Monitor.MonitorCellData
+import blindnet.Endpoints
+import org.http4s.Uri
 
 object Router {
 
   import Util._
+
+  def sendToMonitor(name: String, bytes: Array[Byte], httpClient: Client[IO], direction: String) =
+    for {
+      now     <- IO(LocalDateTime.now())
+      monCell = MonitorCellData(now, name, bytes, direction)
+      req     = POST(monCell.asJson, Uri.unsafeFromString(s"${Endpoints.monitor}/push"))
+      _ <- httpClient
+            .expect[String](req)
+            .handleErrorWith(e => putLnIO(s"Error sending cell to monitor - $e"))
+    } yield ()
 
   def clearConnections(routerConnections: Ref[IO, Connections]) =
     routerConnections.get.flatMap(_.toList.traverse(_._2.socket.close.attempt.void)) *>
@@ -54,7 +68,7 @@ object Router {
   def listenForConnections(
     socketGroup: SocketGroup,
     routers: Ref[IO, Map[String, RouterData]],
-    data: AppData,
+    appData: AppData,
     port: Port
   )(
     implicit cs: ContextShift[IO],
@@ -79,7 +93,7 @@ object Router {
                           // clientSocket,
                           circuits,
                           routers,
-                          data,
+                          appData,
                           routerConnections,
                           httpClient
                         ).onFinalize(clearCircuits(circuits) *> clientSocket.close.attempt.void)
@@ -96,7 +110,9 @@ object Router {
     next: RouterData,
     rConn: RouterConnection,
     circuits: Ref[IO, Map[Short, RCircuitState]],
-    previousMessageSocket: MessageSocket[EncryptedCell, EncryptedCell]
+    previousMessageSocket: MessageSocket[EncryptedCell, EncryptedCell],
+    httpClient: Client[IO],
+    appData: AppData
   )(
     implicit cs: ContextShift[IO],
     ctrStrategy: IvGen[IO, AES128CTR],
@@ -104,7 +120,8 @@ object Router {
   ) =
     nextMsgSocket.read
       .evalTap(ec => putLnIO(s"BACKWARD got encrypted cell from router ${next.id} cId=${ec.circuitId} command=${ec.command}"))
-      .evalMap {
+      .evalTap(ec => sendToMonitor(appData.routerId, ec.getBytesMonitoring, httpClient, "in"))
+      .evalTap {
 
         case EncryptedCell(cId, 2, payload) =>
           for {
@@ -139,6 +156,7 @@ object Router {
 
                                 _ <- putLnIO(s"BACKWARD sending RELAY EXTENDED cell")
                                 _ <- previousMessageSocket.write1(encryptedCell)
+                                _ <- sendToMonitor(appData.routerId, encryptedCell.getBytesMonitoring, httpClient, "out")
                                 // TODO: unsafe
                                 _ <- circuits.update(circs =>
                                       circs.updatedWith(prevCid)(x => Complete(x.get.key, x.get.asInstanceOf[AwaitingNextHop].next).some)
@@ -174,6 +192,7 @@ object Router {
 
                       _ <- putLnIO(s"BACKWARD sending RELAY cell cId=$prevCid, cmd=4")
                       _ <- previousMessageSocket.write1(encryptedCell)
+                      _ <- sendToMonitor(appData.routerId, encryptedCell.getBytesMonitoring, httpClient, "out")
 
                     } yield ()
 
@@ -191,7 +210,8 @@ object Router {
     routers: Ref[IO, Map[String, RouterData]],
     circuits: Ref[IO, Map[Short, RCircuitState]],
     routerConnections: Ref[IO, Connections],
-    httpClient: Client[IO]
+    httpClient: Client[IO],
+    appData: AppData
   )(
     implicit cs: ContextShift[IO],
     ctrStrategy: IvGen[IO, AES128CTR],
@@ -232,7 +252,9 @@ object Router {
                           cell    = Cell(CREATE(hs), nextCircId)
                           payload <- Stream.eval(IO.fromEither(cell.getPayload))
                           _       <- putLnStream(s"FORWARD sending CREATE cell to router ${next.id}")
-                          _       <- Stream.eval(rConn.socket.write1(EncryptedCell(cell.circuitId, cell.cmd.getId, payload)))
+                          ec      = EncryptedCell(cell.circuitId, cell.cmd.getId, payload)
+                          _       <- Stream.eval(rConn.socket.write1(ec))
+                          _       <- Stream.eval(sendToMonitor(appData.routerId, ec.getBytesMonitoring, httpClient, "out"))
 
                           nextHop = NextHop(rConn.socket, nextCircId)
                           _       <- Stream.eval(circuits.update(_ + (previousCircuitId -> AwaitingNextHop(circState.key, nextHop))))
@@ -267,13 +289,15 @@ object Router {
                           cell    = Cell(CREATE(hs), nextCircId)
                           payload <- Stream.eval(IO.fromEither(cell.getPayload))
                           _       <- putLnStream(s"FORWARD sending CREATE cell to router ${next.id}")
-                          _       <- Stream.eval(nextMsgSocket.write1(EncryptedCell(cell.circuitId, cell.cmd.getId, payload)))
+                          ec      = EncryptedCell(cell.circuitId, cell.cmd.getId, payload)
+                          _       <- Stream.eval(nextMsgSocket.write1(ec))
+                          _       <- Stream.eval(sendToMonitor(appData.routerId, ec.getBytesMonitoring, httpClient, "out"))
 
                           nextHop = NextHop(nextMsgSocket, nextCircId)
                           _       <- Stream.eval(circuits.update(_ + (previousCircuitId -> AwaitingNextHop(circState.key, nextHop))))
                           _       <- Stream.eval(rConn.mappings.update(_ + (nextCircId -> previousCircuitId)))
 
-                          _ <- handleNextHopConnection(nextMsgSocket, next, rConn, circuits, previousMessageSocket)
+                          _ <- handleNextHopConnection(nextMsgSocket, next, rConn, circuits, previousMessageSocket, httpClient, appData)
                         } yield ()
 
                         Stream.eval(
@@ -300,8 +324,12 @@ object Router {
             _ <- putLnIO("forwarding cell to msg pool")
 
             cell = blindnet.msgpool.CellData(to, msg)
-            req  = POST(cell.asJson, uri"http://localhost:8081/enqueue")
-            _    <- httpClient.expect(req)(jsonOf[IO, blindnet.msgpool.CellData])
+            req  = POST(cell.asJson, Uri.unsafeFromString(s"${Endpoints.msgPool}/enqueue"))
+            _ <- httpClient
+                  .expect[String](req)
+                  .handleErrorWith(e => putLnIO(s"Sending cell to message pool failed - $e"))
+
+            _ <- sendToMonitor(appData.routerId, cell.data, httpClient, "out")
 
           } yield ())
           .handleErrorWith(_ => Stream.emit(()))
@@ -314,19 +342,20 @@ object Router {
     messageSocket: MessageSocket[EncryptedCell, EncryptedCell],
     circuits: Ref[IO, Map[Short, RCircuitState]],
     handshake: Int,
-    data: AppData,
-    cId: Short
+    appData: AppData,
+    cId: Short,
+    httpClient: Client[IO]
   ) =
     for {
       _ <- IO.unit
       // y      <- IO(Random.between(1, 10))
       y      = 1
-      key    = (math.pow(handshake, y) % data.p).toInt
+      key    = (math.pow(handshake, y) % appData.p).toInt
       aesKey <- AES128CTR.buildKey[IO]((1 to 12).map(_ => 0: Byte).toArray ++ key.toBytes)
       _      <- putLnIO(s"session key=${aesKey.key.getEncoded.toHexString}")
       _      <- circuits.update(_ + (cId -> KeyExchanged(aesKey)))
 
-      hs      = (math.pow(data.g, y) % data.p).toInt
+      hs      = (math.pow(appData.g, y) % appData.p).toInt
       keyHash = key.toBytes.hash[SHA1]
       _       <- putLnIO(s"DH y=$y hs=$hs key_hash=${keyHash.toHexString}")
 
@@ -338,6 +367,7 @@ object Router {
 
       _ <- putLnIO(s"BACKWARD sending CREATED cell")
       _ <- messageSocket.write1(encryptedCell)
+      _ <- sendToMonitor(appData.routerId, encryptedCell.getBytesMonitoring, httpClient, "out")
     } yield ()
 
   def handleConnection(
@@ -346,7 +376,7 @@ object Router {
     // socket: Socket[IO],
     circuits: Ref[IO, Map[Short, RCircuitState]],
     routers: Ref[IO, Map[String, RouterData]],
-    data: AppData,
+    appData: AppData,
     routerConnections: Ref[IO, Connections],
     httpClient: Client[IO]
   )(
@@ -356,6 +386,7 @@ object Router {
   ) =
     messageSocket.read
       .evalTap(ec => putLnIO(s"FORWARD got cell cId=${ec.circuitId} command=${ec.command}"))
+      .evalTap(ec => sendToMonitor(appData.routerId, ec.getBytesMonitoring, httpClient, "in"))
       .flatMap {
         case EncryptedCell(cId, 1, payload) =>
           Stream.eval(
@@ -364,7 +395,7 @@ object Router {
               _ <- cell.cmd match {
                     case CREATE(hs) =>
                       putLnIO(s"FORWARD decoded CREATE cell hs=$hs, cId=${cell.circuitId}")
-                      handleCreateCell(messageSocket, circuits, hs, data, cell.circuitId)
+                      handleCreateCell(messageSocket, circuits, hs, appData, cell.circuitId, httpClient)
                   }
             } yield ()
           )
@@ -392,6 +423,7 @@ object Router {
                             newCell = EncryptedCell(complete.next.cirId, 4, decryptedPayload)
                             _       <- putLnIO(s"FORWARD cell not decoded, sending to next router, cId = ${newCell.circuitId}")
                             _       <- complete.next.messageSocket.write1(newCell)
+                            _       <- sendToMonitor(appData.routerId, newCell.getBytesMonitoring, httpClient, "out")
                           } yield ()
                         case _ =>
                           putLnIO("Cell not properly decoded, no router to forward to") *>
@@ -416,7 +448,8 @@ object Router {
                                     routers,
                                     circuits,
                                     routerConnections,
-                                    httpClient
+                                    httpClient,
+                                    appData
                                   )
                               else
                                 Stream.eval(
@@ -427,6 +460,7 @@ object Router {
                                         newCell = EncryptedCell(complete.next.cirId, 4, decryptedPayload)
                                         _       <- putLnIO("FORWARD bad digest, sending to next router")
                                         _       <- complete.next.messageSocket.write1(newCell)
+                                        _       <- sendToMonitor(appData.routerId, newCell.getBytesMonitoring, httpClient, "out")
                                       } yield ()
                                     case _ =>
                                       putLnIO("Cell bad digest, no router to forward to") *>
@@ -452,16 +486,8 @@ object Router {
 
   def updateRoutersData(routers: Ref[IO, Map[String, RouterData]]) =
     putLnIO("retrieving routers") *>
-      routers.update(_ =>
-        Map(
-          "01" -> RouterData("01", "127.0.0.1", 6666),
-          "02" -> RouterData("02", "127.0.0.1", 6667),
-          "03" -> RouterData("03", "127.0.0.1", 6668),
-          "04" -> RouterData("04", "127.0.0.1", 6669),
-          "05" -> RouterData("05", "127.0.0.1", 6670),
-          "06" -> RouterData("06", "127.0.0.1", 6671)
-        )
-      )
+      routers.update(_ => Endpoints.routers.map(r => r._1 -> RouterData(r._1, r._2, r._3)).toMap)
+
   def handleRoutersUpdating(routers: Ref[IO, Map[String, RouterData]])(implicit t: Timer[IO]) =
     Stream
       .repeatEval(updateRoutersData(routers))

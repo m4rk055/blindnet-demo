@@ -6,7 +6,7 @@ import tsec.cipher.symmetric.jca._
 
 case class RouterData(id: String, ip: String, port: Int)
 
-case class AppData(sk: String, g: Int, p: Int)
+case class AppData(routerId: String, sk: String, g: Int, p: Int)
 
 case class NextHop(messageSocket: MessageSocket[EncryptedCell, EncryptedCell], cirId: Short)
 

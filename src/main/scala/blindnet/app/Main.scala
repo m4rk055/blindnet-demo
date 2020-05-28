@@ -10,32 +10,38 @@ import cats.implicits._
 import cats.effect.concurrent._
 import fs2.io.tcp._
 import fs2.concurrent.Queue
+import tsec.cipher.symmetric._
+import tsec.cipher.symmetric.jca._
 import org.http4s._
 import org.http4s.dsl.io._
 import org.http4s.server.blaze._
-import tsec.cipher.symmetric._
-import tsec.cipher.symmetric.jca._
+import org.http4s.client.dsl.io._
 import org.http4s.client.blaze._
 import org.http4s.implicits._
 import org.http4s.circe._
+import org.http4s.client.Client
 import io.circe.generic.auto._
 import io.circe.{ Decoder, Encoder }
 import io.circe.syntax._
+import io.circe.generic.semiauto.{ deriveDecoder, deriveEncoder }
+import java.time.LocalDateTime
+import blindnet.monitor.Monitor.MonitorCellData
+import blindnet.Endpoints
 
 object DemoApp {
 
   case class SendData(to: String, msg: String)
 
   object SendData {
-    implicit val enc: Encoder[SendData] = io.circe.generic.semiauto.deriveEncoder[SendData]
-    implicit val dec: Decoder[SendData] = io.circe.generic.semiauto.deriveDecoder[SendData]
+    implicit val enc: Encoder[SendData] = deriveEncoder[SendData]
+    implicit val dec: Decoder[SendData] = deriveDecoder[SendData]
   }
 
   case class ReceiveMessage(from: String, msg: String)
 
   object ReceiveMessage {
-    implicit val enc: Encoder[ReceiveMessage] = io.circe.generic.semiauto.deriveEncoder[ReceiveMessage]
-    implicit val dec: Decoder[ReceiveMessage] = io.circe.generic.semiauto.deriveDecoder[ReceiveMessage]
+    implicit val enc: Encoder[ReceiveMessage] = deriveEncoder[ReceiveMessage]
+    implicit val dec: Decoder[ReceiveMessage] = deriveDecoder[ReceiveMessage]
   }
 
   // TODO: horrible
@@ -59,15 +65,20 @@ object DemoApp {
     connections: Ref[IO, Connections],
     completeMessages: Ref[IO, List[(String, String)]],
     q: Queue[IO, String],
-    name: String
+    routerIds1: (Int, Int, Int),
+    routerIds2: (Int, Int, Int),
+    name: String,
+    httpClient: Client[IO]
   )(implicit ctrStrategy: IvGen[IO, AES128CTR], cs: ContextShift[IO], t: Timer[IO]): HttpRoutes[IO] =
     HttpRoutes.of[IO] {
       case GET -> Root / "create" =>
         for {
-          ok <- if (connections.get.unsafeRunSync().size > 0)
-                 Ok("already have circuits")
+          ok <- if (isStateOk(connections))
+                 Ok("circuits exits")
                else
-                 createCircuits(socketGroup, connections, q, (1, 2, 3), (4, 1, 5)) *> Ok("creating circuits")
+                 connections.get.flatMap(cons => cons.toList.traverse(con => con._2.socket.close.attempt.void)) *>
+                   createCircuits(socketGroup, connections, q, routerIds1, routerIds2, name, httpClient) *>
+                   Ok("creating circuits")
         } yield ok
 
       case GET -> Root / "close" =>
@@ -85,10 +96,11 @@ object DemoApp {
                    data.msg,
                    name,
                    data.to,
-                   connections
+                   connections,
+                   httpClient
                  ) *> Ok("messages sent")
                else
-                 Ok("circuits not finished")
+                 Ok("circuits not created")
         } yield ok
 
       case GET -> Root / "receive" =>
@@ -112,11 +124,13 @@ object DemoApp {
     connections: Ref[IO, Connections],
     q: Queue[IO, String],
     routerIds1: (Int, Int, Int),
-    routerIds2: (Int, Int, Int)
+    routerIds2: (Int, Int, Int),
+    name: String,
+    httpClient: Client[IO]
   )(implicit ctrStrategy: IvGen[IO, AES128CTR], cs: ContextShift[IO], t: Timer[IO]) =
-    createCircuit(routerIds1, socketGroup, connections, q).compile.drain.start *>
+    createCircuit(routerIds1, socketGroup, connections, q, name, httpClient).compile.drain.start *>
       IO.sleep(5 second) *>
-      createCircuit(routerIds2, socketGroup, connections, q).compile.drain.start
+      createCircuit(routerIds2, socketGroup, connections, q, name, httpClient).compile.drain.start
 
   def handleIncoming(
     httpClient: org.http4s.client.Client[IO],
@@ -126,8 +140,20 @@ object DemoApp {
   )(implicit t: Timer[IO]): IO[Unit] = {
     val program =
       for {
-        newCells <- httpClient.expect(s"http://localhost:8081/get/$name")(jsonOf[IO, List[Array[Byte]]])
-        _        <- if (newCells.length > 0) handleIncomingCells(received, completeMessages, newCells) else IO.unit
+        newCells <- httpClient.expect(s"${Endpoints.msgPool}/get/$name")(jsonOf[IO, List[Array[Byte]]])
+
+        _ <- newCells.traverse(bytes =>
+              for {
+                now     <- IO(LocalDateTime.now())
+                monCell = MonitorCellData(now, name, bytes, "in")
+                req     = POST(monCell.asJson, Uri.unsafeFromString(s"${Endpoints.monitor}/push"))
+                _ <- httpClient
+                      .expect[String](req)
+                      .handleErrorWith(e => IO(println(s"Error sending cell to monitor - $e")))
+              } yield ()
+            )
+
+        _ <- if (newCells.length > 0) handleIncomingCells(received, completeMessages, newCells) else IO.unit
 
         _ <- IO.sleep(500 millis)
         _ <- handleIncoming(httpClient, received, completeMessages, name)
@@ -158,15 +184,15 @@ object MainAlice extends IOApp {
             connections <- Ref.of[IO, Connections](Map.empty[RouterId, RouterConnection])
             q           <- Queue.bounded[IO, String](100)
             _           <- q.dequeue.evalMap(s => IO(println(s))).compile.drain.start
-            _           <- createCircuits(socketGroup, connections, q, (1, 2, 3), (4, 1, 5))
+            // _           <- createCircuits(socketGroup, connections, q, (1, 2, 3), (4, 1, 5), name, httpClient)
 
             received         <- Ref.of[IO, Received](Map.empty)
             completeMessages <- Ref.of[IO, List[(String, String)]](List.empty)
             _                <- handleIncoming(httpClient, received, completeMessages, name).start
 
             _ <- BlazeServerBuilder[IO](scala.concurrent.ExecutionContext.global)
-                  .bindHttp(8090, "localhost")
-                  .withHttpApp(service(socketGroup, connections, completeMessages, q, name).orNotFound)
+                  .bindHttp(8090, "0.0.0.0")
+                  .withHttpApp(service(socketGroup, connections, completeMessages, q, (1, 2, 3), (4, 1, 5), name, httpClient).orNotFound)
                   .resource
                   .use(_ => IO.never)
           } yield ()
@@ -196,15 +222,15 @@ object MainBob extends IOApp {
             connections <- Ref.of[IO, Connections](Map.empty[RouterId, RouterConnection])
             q           <- Queue.bounded[IO, String](100)
             _           <- q.dequeue.evalMap(s => IO(println(s))).compile.drain.start
-            _           <- createCircuits(socketGroup, connections, q, (6, 2, 4), (4, 5, 6))
+            // _           <- createCircuits(socketGroup, connections, q, (6, 2, 4), (4, 5, 6), name, httpClient)
 
             received         <- Ref.of[IO, Received](Map.empty)
             completeMessages <- Ref.of[IO, List[(String, String)]](List.empty)
             _                <- handleIncoming(httpClient, received, completeMessages, name).start
 
             _ <- BlazeServerBuilder[IO](scala.concurrent.ExecutionContext.global)
-                  .bindHttp(8091, "localhost")
-                  .withHttpApp(service(socketGroup, connections, completeMessages, q, name).orNotFound)
+                  .bindHttp(8091, "0.0.0.0")
+                  .withHttpApp(service(socketGroup, connections, completeMessages, q, (6, 2, 4), (4, 5, 6), name, httpClient).orNotFound)
                   .resource
                   .use(_ => IO.never)
           } yield ()

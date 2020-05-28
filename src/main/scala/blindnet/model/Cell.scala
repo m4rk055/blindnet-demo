@@ -144,7 +144,9 @@ case class EncryptedCell(
   circuitId: Short,
   command: Byte,
   payload: Array[Byte]
-)
+) {
+  def getBytesMonitoring: Array[Byte] = (circuitId.toBytes :+ command) ++ payload
+}
 
 object EncryptedCell {
 

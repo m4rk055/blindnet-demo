@@ -7,6 +7,7 @@ import cats.implicits._
 import fs2._
 import tsec.cipher.symmetric._
 import tsec.cipher.symmetric.jca._
+import blindnet.Endpoints
 
 object Util {
 
@@ -39,14 +40,5 @@ object Services {
 
   def getRouters() =
     IO(println("Obtaining list of routers")) *>
-      IO(
-        List(
-          RouterToConnect("01", "127.0.0.1", 6666, 2, 2000000),
-          RouterToConnect("02", "127.0.0.1", 6667, 3, 2000000),
-          RouterToConnect("03", "127.0.0.1", 6668, 5, 2000000),
-          RouterToConnect("04", "127.0.0.1", 6669, 6, 2000000),
-          RouterToConnect("05", "127.0.0.1", 6670, 7, 2000000),
-          RouterToConnect("06", "127.0.0.1", 6671, 10, 2000000)
-        )
-      )
+      IO(Endpoints.routers.map(r => RouterToConnect(r._1, r._2, r._3, r._4, r._5)))
 }

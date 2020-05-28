@@ -28,7 +28,7 @@ object MsgPool extends IOApp {
                 val msgs = st.get(cell.to).getOrElse(Nil)
                 st.updated(cell.to, msgs :+ cell.data)
               }
-          ok <- Ok()
+          ok <- Ok("")
         } yield ok
 
       case GET -> Root / "get" / id =>
@@ -46,7 +46,7 @@ object MsgPool extends IOApp {
       state <- Ref.of[IO, State](Map.empty)
 
       _ <- BlazeServerBuilder[IO](scala.concurrent.ExecutionContext.Implicits.global)
-            .bindHttp(8081, "localhost")
+            .bindHttp(8081, "0.0.0.0")
             .withHttpApp(service(state).orNotFound)
             .resource
             .use(_ => IO.never)

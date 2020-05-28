@@ -24,7 +24,7 @@ object RouterApp1 extends IOApp {
           def genIvUnsafe: Iv[AES128CTR] = Iv[AES128CTR](zeros)
         }
 
-        val data = AppData("", 2, 2000000)
+        val data = AppData("01", "", 2, 2000000)
         val port = Port(6666).get
         val stream =
           Stream.eval_(IO(println(s"Starting server on port $port"))) ++
@@ -51,7 +51,7 @@ object RouterApp2 extends IOApp {
           def genIvUnsafe: Iv[AES128CTR] = Iv[AES128CTR](zeros)
         }
 
-        val data = AppData("", 3, 2000000)
+        val data = AppData("02", "", 3, 2000000)
         val port = Port(6667).get
         val stream =
           Stream.eval_(IO(println(s"Starting server on port $port"))) ++
@@ -78,7 +78,7 @@ object RouterApp3 extends IOApp {
           def genIvUnsafe: Iv[AES128CTR] = Iv[AES128CTR](zeros)
         }
 
-        val data = AppData("", 5, 2000000)
+        val data = AppData("03", "", 5, 2000000)
         val port = Port(6668).get
         val stream =
           Stream.eval_(IO(println(s"Starting server on port $port"))) ++
@@ -105,7 +105,7 @@ object RouterApp4 extends IOApp {
           def genIvUnsafe: Iv[AES128CTR] = Iv[AES128CTR](zeros)
         }
 
-        val data = AppData("", 6, 2000000)
+        val data = AppData("04", "", 6, 2000000)
         val port = Port(6669).get
         val stream =
           Stream.eval_(IO(println(s"Starting server on port $port"))) ++
@@ -132,7 +132,7 @@ object RouterApp5 extends IOApp {
           def genIvUnsafe: Iv[AES128CTR] = Iv[AES128CTR](zeros)
         }
 
-        val data = AppData("", 7, 2000000)
+        val data = AppData("05", "", 7, 2000000)
         val port = Port(6670).get
         val stream =
           Stream.eval_(IO(println(s"Starting server on port $port"))) ++
@@ -159,7 +159,7 @@ object RouterApp6 extends IOApp {
           def genIvUnsafe: Iv[AES128CTR] = Iv[AES128CTR](zeros)
         }
 
-        val data = AppData("", 10, 2000000)
+        val data = AppData("06", "", 10, 2000000)
         val port = Port(6671).get
         val stream =
           Stream.eval_(IO(println(s"Starting server on port $port"))) ++
