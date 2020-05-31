@@ -129,7 +129,7 @@ object DemoApp {
     httpClient: Client[IO]
   )(implicit ctrStrategy: IvGen[IO, AES128CTR], cs: ContextShift[IO], t: Timer[IO]) =
     createCircuit(routerIds1, socketGroup, connections, q, name, httpClient).compile.drain.start *>
-      IO.sleep(5 second) *>
+      IO.sleep(500 millis) *>
       createCircuit(routerIds2, socketGroup, connections, q, name, httpClient).compile.drain.start
 
   def handleIncoming(
@@ -159,7 +159,7 @@ object DemoApp {
         _ <- handleIncoming(httpClient, received, completeMessages, name)
       } yield ()
 
-    program.handleErrorWith(e => IO(println(e)))
+    program.handleErrorWith(e => IO(println(e)) *> IO.sleep(1 second) *> program)
   }
 }
 

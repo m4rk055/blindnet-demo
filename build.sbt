@@ -1,4 +1,4 @@
-name := "tcp-test"
+name := "blindnet-demo"
 version := "0.0.1"
 
 scalaVersion := "2.13.1"
@@ -55,3 +55,54 @@ addCompilerPlugin("com.olegpy"    %% "better-monadic-for" % "0.3.1")
 addCommandAlias("fix", "all compile:scalafix test:scalafix")
 
 scalafixDependencies in ThisBuild += "com.nequissimus" %% "sort-imports" % "0.3.2"
+
+assemblyMergeStrategy in assembly := {
+  case x if Assembly.isConfigFile(x) =>
+    MergeStrategy.concat
+  case PathList(ps @ _*) if Assembly.isReadme(ps.last) || Assembly.isLicenseFile(ps.last) =>
+    MergeStrategy.rename
+  case PathList("META-INF", xs @ _*) =>
+    (xs map { _.toLowerCase }) match {
+      case ("manifest.mf" :: Nil) | ("index.list" :: Nil) | ("dependencies" :: Nil) =>
+        MergeStrategy.discard
+      case ps @ (x :: xs) if ps.last.endsWith(".sf") || ps.last.endsWith(".dsa") =>
+        MergeStrategy.discard
+      case "services" :: xs =>
+        MergeStrategy.filterDistinctLines
+      case ("io.netty.versions.properties" :: Nil) =>
+        MergeStrategy.concat
+      case _ => MergeStrategy.deduplicate
+    }
+  case "module-info.class" => MergeStrategy.filterDistinctLines
+  case _                   => MergeStrategy.deduplicate
+}
+
+// mainClass in assembly := Some("blindnet.app.MainAlice")
+// assemblyJarName in assembly := "MainAlice.jar"
+
+// mainClass in assembly := Some("blindnet.app.MainBob")
+// assemblyJarName in assembly := "MainBob.jar"
+
+// mainClass in assembly := Some("blindnet.monitor.Monitor")
+// assemblyJarName in assembly := "Monitor.jar"
+
+// mainClass in assembly := Some("blindnet.msgpool.MsgPool")
+// assemblyJarName in assembly := "MsgPool.jar"
+
+// mainClass in assembly := Some("blindnet.router.RouterApp1")
+// assemblyJarName in assembly := "RouterApp1.jar"
+
+// mainClass in assembly := Some("blindnet.router.RouterApp2")
+// assemblyJarName in assembly := "RouterApp2.jar"
+
+// mainClass in assembly := Some("blindnet.router.RouterApp3")
+// assemblyJarName in assembly := "RouterApp3.jar"
+
+// mainClass in assembly := Some("blindnet.router.RouterApp4")
+// assemblyJarName in assembly := "RouterApp4.jar"
+
+// mainClass in assembly := Some("blindnet.router.RouterApp5")
+// assemblyJarName in assembly := "RouterApp5.jar"
+
+mainClass in assembly := Some("blindnet.router.RouterApp6")
+assemblyJarName in assembly := "RouterApp6.jar"
