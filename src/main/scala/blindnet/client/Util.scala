@@ -38,7 +38,9 @@ object Util {
 
 object Services {
 
-  def getRouters() =
+  def getRouters(routersCloudIp: Option[String]) = {
+    val routersIp = routersCloudIp.getOrElse("0.0.0.0")
     IO(println("Obtaining list of routers")) *>
-      IO(Endpoints.routers.map(r => RouterToConnect(r._1, r._2, r._3, r._4, r._5)))
+      IO(Endpoints.routers.map(r => RouterToConnect(r._1, routersIp, r._3, r._4, r._5)))
+  }
 }

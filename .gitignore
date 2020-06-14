@@ -2,3 +2,20 @@
 .metals/
 target/
 metals.sbt
+
+# sbt
+bin/
+project/target
+project/project
+target/
+build/
+
+# mac
+.DS_Store
+
+# intellij idea
+*.log
+*.iml
+*.ipr
+*.iws
+.idea
