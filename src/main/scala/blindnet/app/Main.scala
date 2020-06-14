@@ -20,6 +20,7 @@ import org.http4s.client.blaze._
 import org.http4s.implicits._
 import org.http4s.circe._
 import org.http4s.client.Client
+import org.http4s.server.middleware._
 import io.circe.generic.auto._
 import io.circe.{ Decoder, Encoder }
 import io.circe.syntax._
@@ -71,7 +72,7 @@ object DemoApp {
     name: String,
     httpClient: Client[IO]
   )(implicit ctrStrategy: IvGen[IO, AES128CTR], cs: ContextShift[IO], t: Timer[IO]): HttpRoutes[IO] =
-    HttpRoutes.of[IO] {
+    CORS(HttpRoutes.of[IO] {
       case GET -> Root / "create" =>
         for {
           ok <- if (isStateOk(connections))
@@ -119,7 +120,7 @@ object DemoApp {
           // ok     <- Ok(s"$output")
           ok <- if (isStateOk(connections)) Ok("ok") else Ok("not ok")
         } yield ok
-    }
+    })
 
   def createCircuits(
     socketGroup: SocketGroup,
