@@ -55,15 +55,20 @@ object Client {
   //     }
   //   }
 
-  def sendToMonitor(name: String, bytes: Array[Byte], httpClient: HttpClient[IO], direction: String) =
+  def sendToMonitor(name: String, bytes: Array[Byte], routersCloudIp: Option[String], httpClient: HttpClient[IO], direction: String) = {
+    val monitorIp = routersCloudIp match {
+      case None => Endpoints.monitor
+      case Some(ip) => "http://" + ip + ":8082"
+    }
     for {
-      now     <- IO(LocalDateTime.now())
+      now <- IO(LocalDateTime.now())
       monCell = MonitorCellData(now, name, bytes, direction)
-      req     = POST(monCell.asJson, Uri.unsafeFromString(s"${Endpoints.monitor}/push"))
+      req = POST(monCell.asJson, Uri.unsafeFromString(s"${monitorIp}/push"))
       _ <- httpClient
-            .expect[String](req)
-            .handleErrorWith(e => putLnIO(s"Error sending cell to monitor - $e"))
+        .expect[String](req)
+        .handleErrorWith(e => putLnIO(s"Error sending cell to monitor - $e"))
     } yield ()
+  }
 
   def createSocket(
     socketGroup: SocketGroup,
@@ -90,6 +95,7 @@ object Client {
 
   def createCircuit(
     routerIds: (Int, Int, Int),
+    routersCloudIp: Option[String],
     socketGroup: SocketGroup,
     connections: Ref[IO, Connections],
     q: Queue[IO, String],
@@ -99,7 +105,7 @@ object Client {
     implicit cs: ContextShift[IO],
     ctrStrategy: IvGen[IO, AES128CTR]
   ) =
-    Stream.eval(getRouters()).flatMap { routers =>
+    Stream.eval(getRouters(routersCloudIp)).flatMap { routers =>
       val (r1, r2, r3) = (routers(routerIds._1 - 1), routers(routerIds._2 - 1), routers(routerIds._3 - 1))
 
       def sendCreate(
@@ -119,7 +125,7 @@ object Client {
           // TODO: encrypt with R1 SK
           ec = EncryptedCell(circId, 1, payload)
           _  <- msgSocket.write1(ec)
-          _  <- sendToMonitor(name, ec.getBytesMonitoring, httpClient, "out")
+          _  <- sendToMonitor(name, ec.getBytesMonitoring, routersCloudIp, httpClient, "out")
           _  <- putLnIO(s"sending CREATE cell to R1 with hs=$hs, cId=${circId}")
 
           _ <- circStates.update(_.updated(circId, AwaitingCreated(circId, x, r1, r2, r3)))
@@ -138,7 +144,7 @@ object Client {
                     (for {
                       (circStates, msgSocket) <- createSocket(socketGroup, r1, connections)
                       _                       <- Stream.eval(sendCreate(circStates, msgSocket))
-                      _                       <- process(msgSocket, circStates, q, name, httpClient)
+                      _                       <- process(msgSocket, circStates, q, name, routersCloudIp, httpClient)
                     } yield ())
               }
         } yield ()
@@ -203,6 +209,7 @@ object Client {
     kh: CryptoHash[SHA1],
     circId: Short,
     name: String,
+    routersCloudIp: Option[String],
     httpClient: HttpClient[IO]
   )(implicit ctrStrategy: IvGen[IO, AES128CTR]) =
     for {
@@ -233,7 +240,7 @@ object Client {
       encryptedCell = EncryptedCell(cell.circuitId, cell.cmd.getId, encryptedPayload.content)
 
       _ <- messageSocket.write1(encryptedCell)
-      _ <- sendToMonitor(name, encryptedCell.getBytesMonitoring, httpClient, "out")
+      _ <- sendToMonitor(name, encryptedCell.getBytesMonitoring, routersCloudIp, httpClient, "out")
       _ <- putLnIO(s"sending EXTEND cell for R2 encrypted with K1, hs=$hs2")
     } yield ()
 
@@ -242,6 +249,7 @@ object Client {
     circuitStates: Ref[IO, Map[CircuitId, CircuitState]],
     q: Queue[IO, String],
     name: String,
+    routersCloudIp: Option[String],
     httpClient: HttpClient[IO]
   )(implicit ctrStrategy: IvGen[IO, AES128CTR]): Stream[IO, Unit] =
     messageSocket.read
@@ -259,7 +267,7 @@ object Client {
 
         case Cell(CREATED(hs, kh), cId) =>
           circuitStates.getState(cId).flatMap(cast[AwaitingCreated]).flatMap { circState =>
-            handleCreatedCell(messageSocket, circuitStates, circState, hs, kh, cId, name, httpClient)
+            handleCreatedCell(messageSocket, circuitStates, circState, hs, kh, cId, name, routersCloudIp, httpClient)
           }
 
         // case Destroy
@@ -299,7 +307,7 @@ object Client {
 
                       _ <- putLnIO(s"sending EXTEND cell for R3 encrypted with K1 and K2, hs=$hs3")
                       _ <- messageSocket.write1(encryptedCell)
-                      _ <- sendToMonitor(name, encryptedCell.getBytesMonitoring, httpClient, "out")
+                      _ <- sendToMonitor(name, encryptedCell.getBytesMonitoring, routersCloudIp, httpClient, "out")
                     } yield ()
 
                   case TwoHop(_, x3, r1, r2, r3) =>
@@ -334,6 +342,7 @@ object Client {
     from: String,
     to: String,
     connections: Ref[IO, Connections],
+    routersCloudIp: Option[String],
     httpClient: HttpClient[IO]
   )(implicit ctrStrategy: IvGen[IO, AES128CTR]) =
     for {
@@ -395,7 +404,7 @@ object Client {
 
                 _ <- circuits(i % 2)._1.write1(ec)
 
-                _ <- sendToMonitor(from, ec.getBytesMonitoring, httpClient, "out")
+                _ <- sendToMonitor(from, ec.getBytesMonitoring, routersCloudIp, httpClient, "out")
 
               } yield ()
           }
